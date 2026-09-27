@@ -1,0 +1,19 @@
+name = "minesweeper-api"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+
+[vars]
+MIN_CLIENT_VERSION = "1.0.0"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "minesweeper"
+# Create with `npx wrangler d1 create minesweeper` and paste the id here.
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[triggers]
+crons = ["17 4 * * *"]
+
+[observability]
+enabled = true
