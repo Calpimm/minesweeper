@@ -1,0 +1,103 @@
+name: Release
+
+# Push a tag like v1.2.0 (matching AppInfo.version and a CHANGELOG section) to publish.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+concurrency: release
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      HAS_CERT: ${{ secrets.MACOS_CERTIFICATE != '' }}
+      HAS_TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check version, tag and changelog agree
+        run: |
+          VERSION="$(scripts/version.sh)"
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match AppInfo.version ($VERSION)"; exit 1
+          fi
+          if ! grep -q "^## \[$VERSION\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no section for $VERSION"; exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - run: swift test
+
+      - name: Import Developer ID certificate
+        if: env.HAS_CERT == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"')"
+          [ -n "$IDENTITY" ] || { echo "::error::No Developer ID Application identity in the certificate"; exit 1; }
+          echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Warn about unsigned build
+        if: env.HAS_CERT != 'true'
+        run: echo "::warning::MACOS_CERTIFICATE is not set; this release is ad-hoc signed and not notarized."
+
+      - name: Build
+        env:
+          UNIVERSAL: 1
+          API_BASE_URL: ${{ vars.API_BASE_URL }}
+        run: scripts/build-app.sh
+
+      - name: Notarize
+        if: env.HAS_CERT == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          ZIP="build/Minesweeper-$VERSION.zip"
+          xcrun notarytool submit "$ZIP" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" --wait --timeout 30m
+          xcrun stapler staple build/Minesweeper.app
+          rm "$ZIP"
+          ditto -c -k --keepParent build/Minesweeper.app "$ZIP"
+          spctl --assess --type execute --verbose build/Minesweeper.app
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          awk -v v="$VERSION" '$0 ~ "^## \\[" v "\\]" {f=1; next} /^## \[/ {f=0} f' CHANGELOG.md > build/notes.md
+          SHA256="$(shasum -a 256 "build/Minesweeper-$VERSION.zip" | cut -d' ' -f1)"
+          printf '\n---\n\n**Install:** `brew install --cask calpimm/tap/minesweeper`\n\nSHA-256: `%s`\n' "$SHA256" >> build/notes.md
+          gh release create "$GITHUB_REF_NAME" "build/Minesweeper-$VERSION.zip" \
+            --title "Minesweeper $VERSION" --notes-file build/notes.md --verify-tag
+          echo "SHA256=$SHA256" >> "$GITHUB_ENV"
+
+      - name: Update Homebrew tap
+        if: env.HAS_TAP_TOKEN == 'true'
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/Calpimm/homebrew-tap.git" "$RUNNER_TEMP/tap"
+          mkdir -p "$RUNNER_TEMP/tap/Casks"
+          scripts/cask.sh "$VERSION" "$SHA256" > "$RUNNER_TEMP/tap/Casks/minesweeper.rb"
+          cd "$RUNNER_TEMP/tap"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/minesweeper.rb
+          git commit -m "minesweeper $VERSION"
+          git push

@@ -2,9 +2,10 @@
 import PackageDescription
 
 let package = Package(
-    name: "Minefield",
+    name: "Minesweeper",
     platforms: [.macOS(.v14)],
     targets: [
-        .executableTarget(name: "Minefield", path: "Sources/Minefield")
+        .executableTarget(name: "Minesweeper", path: "Sources/Minesweeper"),
+        .testTarget(name: "MinesweeperTests", dependencies: ["Minesweeper"], path: "Tests/MinesweeperTests"),
     ]
 )
